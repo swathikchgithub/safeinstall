@@ -1,4 +1,4 @@
-import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile as execFileCb } from 'node:child_process';
@@ -7,13 +7,17 @@ import type { RiskFinding } from './types.js';
 
 const execFile = promisify(execFileCb);
 
-// ─── 1. OSV.dev malicious-package DB ─────────────────────────
-export async function checkOsv(pkg: string, version: string): Promise<RiskFinding[]> {
+// ─── 1. OSV.dev malicious-package DB (npm or PyPI) ───────────
+export async function checkOsv(
+  pkg: string,
+  version: string,
+  ecosystem: 'npm' | 'PyPI' = 'npm'
+): Promise<RiskFinding[]> {
   const findings: RiskFinding[] = [];
   const res = await fetch('https://api.osv.dev/v1/query', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ package: { name: pkg, ecosystem: 'npm' }, version }),
+    body: JSON.stringify({ package: { name: pkg, ecosystem }, version }),
   });
   const data = (await res.json()) as any;
   const vulns = data.vulns ?? [];
@@ -44,7 +48,7 @@ export async function checkOsv(pkg: string, version: string): Promise<RiskFindin
   return findings;
 }
 
-// ─── 2. npm registry metadata + install hooks ────────────────
+// ─── 2a. npm registry metadata + install hooks ───────────────
 export async function checkNpm(pkg: string, version: string) {
   const findings: RiskFinding[] = [];
   let tarballUrl: string | null = null;
@@ -87,7 +91,57 @@ export async function checkNpm(pkg: string, version: string) {
   return { findings, tarballUrl, actualVersion };
 }
 
-// ─── 3. Tarball download + static pattern scan ───────────────
+// ─── 2b. PyPI registry metadata + yanked detection ──────────
+export async function checkPyPI(pkg: string, version: string) {
+  const findings: RiskFinding[] = [];
+  let downloadUrl: string | null = null;
+
+  const res = await fetch(`https://pypi.org/pypi/${pkg}/json`);
+  if (!res.ok) {
+    findings.push({ level: 'high', category: 'METADATA', message: 'Package not found on PyPI' });
+    return { findings, downloadUrl, actualVersion: version };
+  }
+  const data = (await res.json()) as any;
+  const actualVersion = version === 'latest' ? data.info?.version : version;
+  const releases = data.releases?.[actualVersion];
+
+  if (!releases || releases.length === 0) {
+    findings.push({ level: 'high', category: 'METADATA', message: `Version ${actualVersion} not found on PyPI` });
+    return { findings, downloadUrl, actualVersion };
+  }
+
+  // Prefer sdist (.tar.gz) over wheel (.whl) for source inspection
+  const sdist = releases.find((r: any) => r.packagetype === 'sdist');
+  const wheel = releases.find((r: any) => r.packagetype === 'bdist_wheel');
+  downloadUrl = sdist?.url ?? wheel?.url ?? releases[0]?.url ?? null;
+
+  const uploadTime = sdist?.upload_time ?? releases[0]?.upload_time;
+  if (uploadTime) {
+    const ageDays = (Date.now() - new Date(uploadTime).getTime()) / 86400000;
+    if (ageDays < 30) {
+      findings.push({ level: 'medium', category: 'REPUTATION', message: `Package only ${Math.round(ageDays)} days old` });
+    }
+  }
+
+  // Yanked = soft-removed from PyPI; strong signal
+  const yanked = releases.find((r: any) => r.yanked);
+  if (yanked) {
+    findings.push({
+      level: 'high',
+      category: 'METADATA',
+      message: `Yanked from PyPI${yanked.yanked_reason ? ': ' + yanked.yanked_reason : ''}`,
+    });
+  }
+
+  // Missing author metadata is a low-confidence signal for typosquats
+  if (!data.info?.author && !data.info?.author_email && !data.info?.maintainer) {
+    findings.push({ level: 'low', category: 'REPUTATION', message: 'No author/maintainer metadata' });
+  }
+
+  return { findings, downloadUrl, actualVersion };
+}
+
+// ─── 3a. npm tarball download + static scan ──────────────────
 export async function checkTarball(tarballUrl: string): Promise<{ findings: RiskFinding[]; mainCode: string }> {
   const findings: RiskFinding[] = [];
   let mainCode = '';
@@ -101,7 +155,6 @@ export async function checkTarball(tarballUrl: string): Promise<{ findings: Risk
     const pkgDir = join(tmp, 'package');
     const pkgJson = JSON.parse(await readFile(join(pkgDir, 'package.json'), 'utf8'));
 
-    // Build list of entry-point candidates to handle ESM packages
     const candidates: string[] = [];
     if (pkgJson.main) candidates.push(pkgJson.main);
     if (pkgJson.module) candidates.push(pkgJson.module);
@@ -123,14 +176,10 @@ export async function checkTarball(tarballUrl: string): Promise<{ findings: Risk
       if (!c) continue;
       try {
         const content = await readFile(join(pkgDir, c), 'utf8');
-        if (content.length > 50) {
-          mainCode = content;
-          break;
-        }
+        if (content.length > 50) { mainCode = content; break; }
       } catch {}
     }
 
-    // Pattern scan on top-level JS files
     const found = await execFile('find', [pkgDir, '-name', '*.js', '-type', 'f', '-maxdepth', '3']);
     const files = found.stdout.split('\n').filter(Boolean).slice(0, 20);
     let evalBase64 = 0, netExec = 0, obfusc = 0;
@@ -153,8 +202,103 @@ export async function checkTarball(tarballUrl: string): Promise<{ findings: Risk
   return { findings, mainCode };
 }
 
-// ─── 4. LLM-powered code review (always emits a finding) ─────
-export async function checkLlm(pkg: string, code: string): Promise<RiskFinding[]> {
+// ─── 3b. PyPI sdist download + setup.py scan + static scan ───
+export async function checkPyPISdist(downloadUrl: string): Promise<{ findings: RiskFinding[]; mainCode: string }> {
+  const findings: RiskFinding[] = [];
+  let mainCode = '';
+  const tmp = await mkdtemp(join(tmpdir(), 'safeinstall-py-'));
+
+  try {
+    const archivePath = join(tmp, downloadUrl.endsWith('.whl') ? 'pkg.whl' : 'pkg.tar.gz');
+    const buf = Buffer.from(await (await fetch(downloadUrl)).arrayBuffer());
+    await writeFile(archivePath, buf);
+
+    const extractDir = join(tmp, 'extracted');
+    await mkdir(extractDir, { recursive: true });
+
+    if (downloadUrl.endsWith('.whl') || downloadUrl.endsWith('.zip')) {
+      await execFile('unzip', ['-q', archivePath, '-d', extractDir]);
+    } else {
+      await execFile('tar', ['-xzf', archivePath, '-C', extractDir]);
+    }
+
+    // Find top-level dir (sdist usually has one like pkgname-1.0.0/)
+    const lsResult = await execFile('ls', [extractDir]);
+    const entries = lsResult.stdout.trim().split('\n').filter(Boolean);
+    if (entries.length === 0) {
+      findings.push({ level: 'info', category: 'STATIC', message: 'Empty archive' });
+      return { findings, mainCode };
+    }
+    const pkgDir = join(extractDir, entries[0]);
+
+    // ─── setup.py — Python's install-hook equivalent ───────
+    try {
+      const setupPy = await readFile(join(pkgDir, 'setup.py'), 'utf8');
+      const hasDangerousImports = /\b(subprocess|os\.system|os\.popen|urllib|requests|socket|pty|ctypes|paramiko)\b/.test(setupPy);
+      const hasExecPatterns = /\b(exec|eval|compile|__import__)\s*\(/.test(setupPy);
+      const hasBase64 = /\b(base64|b64decode|b64encode|fromhex)\b/.test(setupPy);
+
+      if ((hasDangerousImports || hasExecPatterns) && hasBase64) {
+        findings.push({
+          level: 'critical',
+          category: 'INSTALL HOOK',
+          message: 'setup.py contains base64 decoding + exec/network patterns (classic install-time payload)',
+        });
+      } else if (hasExecPatterns || hasDangerousImports) {
+        findings.push({
+          level: 'high',
+          category: 'INSTALL HOOK',
+          message: 'setup.py contains exec/subprocess/network code that runs during pip install',
+        });
+      }
+    } catch {
+      // No setup.py — modern packages may use pyproject.toml only, which is declarative and safer
+    }
+
+    // ─── Find main package code ─────────────────────────────
+    const pkgName = entries[0].split('-')[0].replace(/_/g, '-');
+    const altName = entries[0].split('-')[0]; // some packages use underscores in dir
+    const candidates = [
+      `${altName}/__init__.py`,
+      `${pkgName}/__init__.py`,
+      `src/${altName}/__init__.py`,
+      `src/${pkgName}/__init__.py`,
+      `${altName}.py`,
+      'setup.py',
+    ];
+
+    for (const c of candidates) {
+      try {
+        const content = await readFile(join(pkgDir, c), 'utf8');
+        if (content.length > 50) { mainCode = content; break; }
+      } catch {}
+    }
+
+    // ─── Pattern scan on .py files ───────────────────────────
+    const found = await execFile('find', [pkgDir, '-name', '*.py', '-type', 'f', '-maxdepth', '4']);
+    const files = found.stdout.split('\n').filter(Boolean).slice(0, 30);
+    let execBase64 = 0, netExec = 0, obfusc = 0;
+
+    for (const f of files) {
+      const c = await readFile(f, 'utf8');
+      if (/(?:exec|eval)\s*\(\s*[^)]{0,200}(?:base64|b64decode|fromhex)/.test(c)) execBase64++;
+      if (/(subprocess|os\.system|os\.popen|pty\.spawn)\b[\s\S]{0,300}(urllib|requests|socket|http)/.test(c)) netExec++;
+      if (/(\\x[0-9a-f]{2}){15,}/i.test(c) || /(?:chr\(\d+\)\s*\+\s*){5,}/.test(c)) obfusc++;
+    }
+
+    if (execBase64) findings.push({ level: 'critical', category: 'STATIC', message: `${execBase64} exec+base64 patterns (Python payload obfuscation)` });
+    if (netExec)    findings.push({ level: 'high',     category: 'STATIC', message: `${netExec} files combining network with subprocess execution` });
+    if (obfusc)     findings.push({ level: 'high',     category: 'STATIC', message: `${obfusc} files with character/hex obfuscation` });
+  } catch (err) {
+    findings.push({ level: 'info', category: 'STATIC', message: `Sdist scan skipped: ${err}` });
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+  return { findings, mainCode };
+}
+
+// ─── 4. LLM-powered code review (language-aware) ─────────────
+export async function checkLlm(pkg: string, code: string, language: 'javascript' | 'python' = 'javascript'): Promise<RiskFinding[]> {
   const findings: RiskFinding[] = [];
 
   if (!process.env.OPENROUTER_API_KEY) {
@@ -166,11 +310,12 @@ export async function checkLlm(pkg: string, code: string): Promise<RiskFinding[]
     return findings;
   }
 
-  const prompt = `Analyze this npm package for security risks. Look for: credential exfiltration, suspicious network calls, obfuscation, backdoors, persistence, postinstall payloads.
+  const ecosystemName = language === 'python' ? 'PyPI' : 'npm';
+  const prompt = `Analyze this ${ecosystemName} package for security risks. Look for: credential exfiltration, suspicious network calls, obfuscation, backdoors, persistence, install-time payloads.
 
 Package: ${pkg}
 Code (first 6000 chars):
-\`\`\`javascript
+\`\`\`${language}
 ${code.slice(0, 6000)}
 \`\`\`
 
@@ -220,7 +365,6 @@ Important: only list concerns about THIS package's code. Do NOT mention analysis
         message: `${p.summary || 'no summary'} [score ${s}/10]`,
       });
       for (const c of p.concerns ?? []) {
-        // Filter meta-concerns about the analysis/tool, not the package
         if (/partial|truncat|complete (audit|source|code)|require.*review/i.test(c)) continue;
         if (/use.*latest|update.*version|patched.*version|upgrade/i.test(c)) continue;
         findings.push({ level: 'medium', category: 'LLM CONCERN', message: c });
@@ -242,7 +386,7 @@ export function score(findings: RiskFinding[]) {
 
   const hasMal = findings.some((f) => f.category === 'KNOWN MALICIOUS');
   const removedFromRegistry = findings.some(
-    (f) => f.category === 'METADATA' && (f.message.includes('not found') || f.message.includes('Version')),
+    (f) => f.category === 'METADATA' && (f.message.includes('not found') || f.message.includes('Yanked')),
   );
   if (hasMal && removedFromRegistry) {
     return { total: 100, verdict: 'block' as const };
