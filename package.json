@@ -1,0 +1,22 @@
+{
+  "name": "safeinstall",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "safeinstall": "./dist/cli.js"
+  },
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "build": "tsc",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "Multi-layered npm/pip supply chain risk scanner",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}
