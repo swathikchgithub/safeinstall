@@ -332,7 +332,7 @@ Important: only list concerns about THIS package's code. Do NOT mention analysis
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: process.env.SAFEINSTALL_MODEL || 'minimax/minimax-m2.7',
+        model: process.env.SAFEINSTALL_MODEL || 'openai/gpt-4.1-mini',
         messages: [{ role: 'user', content: prompt }],
         max_tokens: 500,
       }),

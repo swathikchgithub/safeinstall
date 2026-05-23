@@ -8,15 +8,41 @@
   "scripts": {
     "dev": "tsx src/cli.ts",
     "build": "tsc",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "prepare": "npm run build"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "npm",
+    "pip",
+    "security",
+    "supply-chain",
+    "malware",
+    "audit",
+    "llm",
+    "package-scanner"
+  ],
+  "author": "Swathi Kumar Chadalavada",
+  "license": "MIT",
   "description": "Multi-layered npm/pip supply chain risk scanner",
   "devDependencies": {
-    "@types/node": "^22.0.0",
+    "@types/node": "^22.19.19",
     "tsx": "^4.0.0",
     "typescript": "^5.0.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/swathikchgithub/safeinstall.git"
+  },
+  "homepage": "https://github.com/swathikchgithub/safeinstall#readme",
+  "bugs": {
+    "url": "https://github.com/swathikchgithub/safeinstall/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ]
 }
